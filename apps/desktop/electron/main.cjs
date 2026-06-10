@@ -14,7 +14,8 @@ const {
   safeStorage,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } = require('electron')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -61,6 +62,12 @@ const {
   resolveReadableFileForIpc,
   resolveTimeoutMs
 } = require('./hardening.cjs')
+const {
+  buildTrayMenuTemplate,
+  shouldCreateTray,
+  shouldHideMainWindowOnClose,
+  shouldQuitWhenAllWindowsClosed
+} = require('./tray-window-behavior.cjs')
 
 let nodePty = null
 
@@ -522,6 +529,8 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let tray = null
+let isQuitting = false
 let hermesProcess = null
 let connectionPromise = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
@@ -4787,6 +4796,38 @@ function focusWindow(win) {
   win.focus()
 }
 
+function showMainWindow() {
+  focusWindow(mainWindow)
+}
+
+function quitFromTray() {
+  isQuitting = true
+  app.quit()
+}
+
+function ensureTray() {
+  if (!shouldCreateTray({ isMac: IS_MAC, existingTray: tray })) return
+
+  const icon = getAppIconPath()
+  if (!icon) {
+    rememberLog('[tray] skipped: no app icon available')
+    return
+  }
+
+  tray = new Tray(icon)
+  tray.setToolTip('Hermes')
+  tray.setContextMenu(
+    Menu.buildFromTemplate(
+      buildTrayMenuTemplate({
+        open: showMainWindow,
+        quit: quitFromTray
+      })
+    )
+  )
+  tray.on('click', showMainWindow)
+  tray.on('double-click', showMainWindow)
+}
+
 // Open (or focus) a standalone window for a single chat session.
 function createSessionWindow(sessionId) {
   return sessionWindows.openOrFocus(sessionId, () => {
@@ -4894,6 +4935,12 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+  mainWindow.on('close', event => {
+    if (!shouldHideMainWindowOnClose({ isMac: IS_MAC, isQuitting })) return
+
+    event.preventDefault()
+    mainWindow.hide()
+  })
 
   wireCommonWindowHandlers(mainWindow)
 
@@ -5974,6 +6021,7 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
+  ensureTray()
   createWindow()
 
   app.on('activate', () => {
@@ -6012,6 +6060,8 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  isQuitting = true
+
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {
     try {
@@ -6032,8 +6082,12 @@ app.on('before-quit', () => {
     hermesProcess.kill('SIGTERM')
   }
   stopAllPoolBackends()
+  tray?.destroy?.()
+  tray = null
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (shouldQuitWhenAllWindowsClosed({ platform: process.platform, hasTray: Boolean(tray) })) {
+    app.quit()
+  }
 })
