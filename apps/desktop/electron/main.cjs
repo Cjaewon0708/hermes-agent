@@ -3,6 +3,7 @@ const {
   BrowserWindow,
   Menu,
   Notification,
+  Tray,
   clipboard,
   dialog,
   ipcMain,
@@ -27,6 +28,14 @@ const { execFileSync, spawn } = require('node:child_process')
 const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
 const { buildSessionWindowUrl, createSessionWindowRegistry } = require('./session-windows.cjs')
+const {
+  buildTrayMenuTemplate,
+  currentSessionIdFromUrl,
+  sessionRouteHash,
+  shouldCreateTray,
+  shouldHideMainWindowOnClose,
+  shouldQuitWhenAllWindowsClosed
+} = require('./tray-window-behavior.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
@@ -535,6 +544,10 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let tray = null
+let isQuitting = false
+let trayMenuRefreshTimer = null
+let trayRecentSessions = []
 let hermesProcess = null
 let connectionPromise = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
@@ -561,6 +574,8 @@ let poolIdleReaper = null
 // window so the user can read the error / quit.
 const RENDERER_RELOAD_WINDOW_MS = 60_000
 const RENDERER_RELOAD_MAX = 3
+const TRAY_RECENT_SESSION_LIMIT = 5
+const TRAY_MENU_REFRESH_MS = 60_000
 let rendererReloadTimes = []
 // Latched bootstrap failure: when the first-launch install fails, we hold
 // onto the error so subsequent startHermes() calls (e.g. the renderer's
@@ -4898,6 +4913,102 @@ function createSessionWindow(sessionId) {
   })
 }
 
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  focusWindow(mainWindow)
+}
+
+function navigateMainWindowToHash(hash) {
+  showMainWindow()
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  const script = `window.location.hash = ${JSON.stringify(hash)}`
+  mainWindow.webContents.executeJavaScript(script, true).catch(error => {
+    rememberLog(`[tray] hash navigation failed: ${error?.message || error}`)
+    try {
+      const current = mainWindow.webContents.getURL()
+      const base = current ? current.split('#', 1)[0] : pathToFileURL(resolveRendererIndex()).toString()
+      mainWindow.loadURL(`${base}${hash}`)
+    } catch (fallbackError) {
+      rememberLog(`[tray] fallback navigation failed: ${fallbackError?.message || fallbackError}`)
+    }
+  })
+}
+
+function currentMainWindowSessionId() {
+  try {
+    return mainWindow && !mainWindow.isDestroyed() ? currentSessionIdFromUrl(mainWindow.webContents.getURL()) : ''
+  } catch {
+    return ''
+  }
+}
+
+function quitFromTray() {
+  isQuitting = true
+  app.quit()
+}
+
+function refreshTrayMenu() {
+  if (!tray) return
+
+  const currentSessionId = currentMainWindowSessionId()
+  const template = buildTrayMenuTemplate({
+    currentSessionId,
+    open: showMainWindow,
+    openCurrentSession: showMainWindow,
+    openNewSession: () => navigateMainWindowToHash(sessionRouteHash('')),
+    openSession: sessionId => navigateMainWindowToHash(sessionRouteHash(sessionId)),
+    quit: quitFromTray,
+    recentSessions: trayRecentSessions
+  })
+  tray.setContextMenu(Menu.buildFromTemplate(template))
+}
+
+async function refreshTraySessionsAndMenu() {
+  try {
+    const result = await fetchJsonForProfile(
+      null,
+      `/api/profiles/sessions?limit=${TRAY_RECENT_SESSION_LIMIT}&offset=0&min_messages=1&archived=exclude&order=recent&profile=all&exclude_sources=cron`
+    )
+    trayRecentSessions = Array.isArray(result?.sessions) ? result.sessions : []
+  } catch (error) {
+    rememberLog(`[tray] recent sessions refresh failed: ${error?.message || error}`)
+  }
+
+  refreshTrayMenu()
+}
+
+function ensureTray() {
+  if (!shouldCreateTray({ isMac: IS_MAC, existingTray: tray })) return tray
+
+  const iconPath = getAppIconPath()
+  const trayIcon = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
+  tray = new Tray(trayIcon)
+  tray.setToolTip('Hermes')
+  refreshTrayMenu()
+
+  tray.on('click', showMainWindow)
+  tray.on('double-click', showMainWindow)
+  tray.on('right-click', () => {
+    refreshTraySessionsAndMenu().catch(error => rememberLog(`[tray] right-click refresh failed: ${error?.message || error}`))
+  })
+
+  if (!trayMenuRefreshTimer) {
+    trayMenuRefreshTimer = setInterval(() => {
+      refreshTraySessionsAndMenu().catch(error => rememberLog(`[tray] timer refresh failed: ${error?.message || error}`))
+    }, TRAY_MENU_REFRESH_MS)
+  }
+
+  return tray
+}
+
 function createWindow() {
   const icon = getAppIconPath()
   mainWindow = new BrowserWindow({
@@ -4937,6 +5048,23 @@ function createWindow() {
     }
   })
 
+  ensureTray()
+
+  mainWindow.on('close', event => {
+    if (!shouldHideMainWindowOnClose({ isMac: IS_MAC, isQuitting })) return
+
+    event.preventDefault()
+    mainWindow.hide()
+    refreshTrayMenu()
+  })
+
+  mainWindow.on('closed', () => {
+    if (mainWindow && mainWindow.isDestroyed()) {
+      mainWindow = null
+    }
+    refreshTrayMenu()
+  })
+
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
     if (icon) {
@@ -4959,6 +5087,8 @@ function createWindow() {
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
 
   wireCommonWindowHandlers(mainWindow)
+  mainWindow.webContents.on('did-navigate-in-page', refreshTrayMenu)
+  mainWindow.webContents.on('did-finish-load', refreshTrayMenu)
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
@@ -5015,7 +5145,9 @@ function createWindow() {
     restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()
-    startHermes().catch(error => rememberLog(error.stack || error.message))
+    startHermes()
+      .then(() => refreshTraySessionsAndMenu())
+      .catch(error => rememberLog(error.stack || error.message))
   })
 }
 
@@ -6192,6 +6324,13 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  isQuitting = true
+
+  if (trayMenuRefreshTimer) {
+    clearInterval(trayMenuRefreshTimer)
+    trayMenuRefreshTimer = null
+  }
+
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {
     try {
@@ -6215,5 +6354,5 @@ app.on('before-quit', () => {
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (shouldQuitWhenAllWindowsClosed({ platform: process.platform, hasTray: Boolean(tray) })) app.quit()
 })
